@@ -4,17 +4,17 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import httpx
 
-app = FastAPI(title="Social Aggregator Minimal API", version="0.1.0")
+app = FastAPI(title="Social Aggregator Minimal API", version="0.1.1")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-def ensure_token():
-    if not TELEGRAM_BOT_TOKEN:
+def get_token() -> str:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
         raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN is not set")
+    return token
 
 async def tg_send_message(chat_id: str, text: str):
-    ensure_token()
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    token = get_token()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.post(url, json=payload)
@@ -28,14 +28,18 @@ def root():
 
 @app.get("/api/feed")
 def feed():
+    # Пустая лента (позже добавим сбор из VK/TG)
     return []
 
+# Удобный тест без JSON: просто открыть в браузере
+# /api/telegram/send?chat_id=-100xxxxxxxxxx&text=Hello
 @app.get("/api/telegram/send")
 async def telegram_send(chat_id: str, text: str):
     result = await tg_send_message(chat_id=chat_id, text=text)
     return {"ok": True, "result": result}
 
-Provider = Literal["tg"]
+# Унифицированная публикация (поддерживает только TG пока)
+Provider = Literal["tg"]  # позже добавим "vk"
 
 class Attachment(BaseModel):
     type: Literal["image", "video", "link"]
@@ -48,7 +52,7 @@ class Content(BaseModel):
 
 class Target(BaseModel):
     provider: Provider
-    sourceId: str
+    sourceId: str  # для TG — это chat_id канала
 
 class PublishRequest(BaseModel):
     targets: List[Target]
@@ -59,7 +63,7 @@ class PublishResponse(BaseModel):
 
 @app.post("/api/posts/publish", response_model=PublishResponse)
 async def publish(req: PublishRequest):
-       errors = []
+    errors = []
     for t in req.targets:
         if t.provider == "tg":
             try:
@@ -72,8 +76,10 @@ async def publish(req: PublishRequest):
         raise HTTPException(status_code=500, detail={"errors": errors})
     return PublishResponse(status="ok")
 
+# Webhook для Telegram (на будущее)
 @app.post("/api/webhooks/telegram")
 async def telegram_webhook(req: Request):
     data = await req.json()
+    # Пока просто печатаем — Render покажет в логах
     print("Telegram webhook:", data)
     return {"ok": True}
