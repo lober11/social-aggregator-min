@@ -1,10 +1,11 @@
 import os
 from typing import List, Optional, Literal
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 import httpx
 
-app = FastAPI(title="Social Aggregator Minimal API", version="0.2.0")
+app = FastAPI(title="Social Aggregator Minimal API", version="0.2.1")
 
 def get_token() -> str:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -22,7 +23,7 @@ async def verify_api_key(request: Request, x_api_key: Optional[str] = Header(def
     """
     Проверка ключа доступа:
     - Основной способ: заголовок X-Api-Key
-    - Упрощение для браузерного теста GET: ?key=<0c2d834342bbc260c76ec32bc0542977> (если заголовка нет)
+    - Упрощение для браузера (GET): ?key=<секрет>, если заголовка нет
     """
     secret = get_publish_secret()
     candidate = x_api_key or request.query_params.get("key")
@@ -39,16 +40,31 @@ async def tg_send_message(chat_id: str, text: str):
             raise HTTPException(status_code=500, detail=f"Telegram error: {r.text}")
         return r.json()
 
+# Root
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Social Aggregator Minimal API"}
 
+@app.head("/")
+def root_head():
+    # Для health-check от Render методом HEAD
+    return PlainTextResponse("", status_code=200)
+
+# Health endpoint (GET и HEAD)
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+@app.head("/health")
+def health_head():
+    return PlainTextResponse("", status_code=200)
+
+# Пустая лента (добавим позже сбор из VK/TG)
 @app.get("/api/feed")
 def feed():
-    # Пустая лента (добавим позже)
     return []
 
-# Тестовая отправка в TG (требует X-Api-Key; допускает ?key=... для удобства в браузере)
+# Тестовая отправка в TG (защищено X-Api-Key; допускает ?key=... для удобства в браузере)
 # /api/telegram/send?chat_id=-100xxxxxxxxxx&text=Hello&key=YOUR_SECRET
 @app.get("/api/telegram/send", dependencies=[Depends(verify_api_key)])
 async def telegram_send(chat_id: str, text: str):
@@ -93,7 +109,7 @@ async def publish(req: PublishRequest):
         raise HTTPException(status_code=500, detail={"errors": errors})
     return PublishResponse(status="ok")
 
-# Webhook для Telegram (оставляем открытым — Telegram не будет слать наш заголовок)
+# Webhook для Telegram (оставляем открытым — Telegram не присылает наш заголовок)
 @app.post("/api/webhooks/telegram")
 async def telegram_webhook(req: Request):
     data = await req.json()
