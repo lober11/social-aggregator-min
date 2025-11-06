@@ -5,7 +5,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 import httpx
 
-app = FastAPI(title="Social Aggregator Minimal API", version="0.2.1")
+app = FastAPI(title="Social Aggregator Minimal API", version="0.2.2")
 
 def get_token() -> str:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -19,15 +19,10 @@ def get_publish_secret() -> str:
         raise HTTPException(status_code=500, detail="PUBLISH_SECRET is not set")
     return secret
 
-async def verify_api_key(request: Request, x_api_key: Optional[str] = Header(default=None)):
-    """
-    Проверка ключа доступа:
-    - Основной способ: заголовок X-Api-Key
-    - Упрощение для браузера (GET): ?key=<секрет>, если заголовка нет
-    """
+# Проверка ключа доступа: ТОЛЬКО через заголовок X-Api-Key
+async def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
     secret = get_publish_secret()
-    candidate = x_api_key or request.query_params.get("key")
-    if candidate != secret:
+    if x_api_key != secret:
         raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing X-Api-Key")
 
 async def tg_send_message(chat_id: str, text: str):
@@ -47,7 +42,6 @@ def root():
 
 @app.head("/")
 def root_head():
-    # Для health-check от Render методом HEAD
     return PlainTextResponse("", status_code=200)
 
 # Health endpoint (GET и HEAD)
@@ -59,20 +53,19 @@ def health():
 def health_head():
     return PlainTextResponse("", status_code=200)
 
-# Пустая лента (добавим позже сбор из VK/TG)
+# Пустая лента (зарезервировано под будущее)
 @app.get("/api/feed")
 def feed():
     return []
 
-# Тестовая отправка в TG (защищено X-Api-Key; допускает ?key=... для удобства в браузере)
-# /api/telegram/send?chat_id=-100xxxxxxxxxx&text=Hello&key=YOUR_SECRET
+# Тестовая отправка в TG (требует X-Api-Key)
 @app.get("/api/telegram/send", dependencies=[Depends(verify_api_key)])
 async def telegram_send(chat_id: str, text: str):
     result = await tg_send_message(chat_id=chat_id, text=text)
     return {"ok": True, "result": result}
 
 # Унифицированная публикация (поддерживает только TG пока) — защищено X-Api-Key
-Provider = Literal["tg"]  # позже добавим "vk"
+Provider = Literal["tg"]
 
 class Attachment(BaseModel):
     type: Literal["image", "video", "link"]
@@ -113,6 +106,5 @@ async def publish(req: PublishRequest):
 @app.post("/api/webhooks/telegram")
 async def telegram_webhook(req: Request):
     data = await req.json()
-    # Render покажет в Runtime Logs
     print("Telegram webhook:", data)
     return {"ok": True}
