@@ -1,6 +1,5 @@
 import os
 from typing import List, Optional, Literal
-
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, Query
@@ -11,7 +10,8 @@ import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-app = FastAPI(title="Social Aggregator Minimal API", version="0.3.0")
+app = FastAPI(title="Social Aggregator Minimal API", version="0.3.1")
+
 
 # ==== Настройки и хелперы =====================================================
 
@@ -170,8 +170,14 @@ async def telegram_send(chat_id: str, text: str):
 
 
 # Унифицированная публикация (поддерживает только TG пока) — защищено X-Api-Key
+# Оба пути работают: /api/posts/publish и /api/publish
 @app.post(
     "/api/posts/publish",
+    response_model=PublishResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+@app.post(
+    "/api/publish",
     response_model=PublishResponse,
     dependencies=[Depends(verify_api_key)],
 )
@@ -278,7 +284,7 @@ async def telegram_webhook(req: Request):
     return {"ok": True}
 
 
-# ==== API для получения входящих сообщений ====================================
+# ==== API для получения и изменения входящих сообщений ========================
 
 @app.get(
     "/api/inbox",
@@ -326,3 +332,33 @@ def get_inbox(
 
     # rows — это список dict благодаря RealDictCursor
     return [InboxMessage(**row) for row in rows]
+
+
+@app.post(
+    "/api/inbox/{message_id}/read",
+    dependencies=[Depends(verify_api_key)],
+)
+def mark_inbox_read(message_id: int):
+    """
+    Помечает сообщение как прочитанное: status = 'read' по id.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE incoming_messages
+            SET status = 'read'
+            WHERE id = %(id)s;
+            """,
+            {"id": message_id},
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Message not found")
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    return {"status": "ok"}
