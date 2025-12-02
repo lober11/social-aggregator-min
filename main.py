@@ -1,14 +1,18 @@
 import os
+import json
 from typing import List, Optional, Literal
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Request, Depends, Header, Query
+from fastapi import FastAPI, HTTPException, Request, Depends, Header, Query, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 import httpx
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 app = FastAPI(title="Social Aggregator Minimal API", version="0.3.1")
 
@@ -90,6 +94,81 @@ def init_db():
 
 
 init_db()
+
+
+# ==== Firebase Admin для FCM ==================================================
+
+firebase_app = None
+
+
+def init_firebase():
+    """
+    Ленивая инициализация Firebase Admin SDK.
+    Берём JSON сервисного аккаунта из переменной окружения FIREBASE_SERVICE_ACCOUNT_JSON.
+    """
+    global firebase_app
+    if firebase_app is not None:
+        return
+
+    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if not sa_json:
+        print("FIREBASE_SERVICE_ACCOUNT_JSON is not set")
+        return
+
+    try:
+        cred = credentials.Certificate(json.loads(sa_json))
+        firebase_app = firebase_admin.initialize_app(cred)
+        print("Firebase app initialized")
+    except Exception as e:
+        print("Error initializing Firebase:", e)
+        firebase_app = None
+
+
+def send_unread_count_push(unread_count: int):
+    """
+    Отправляет data-push в FCM с полем unread_count.
+    Токен устройства берём из FCM_DEVICE_TOKEN.
+    """
+    init_firebase()
+    if firebase_app is None:
+        return
+
+    device_token = os.environ.get("FCM_DEVICE_TOKEN")
+    if not device_token:
+        print("FCM_DEVICE_TOKEN is not set")
+        return
+
+    message = messaging.Message(
+        data={
+            "unread_count": str(unread_count)
+        },
+        token=device_token,
+    )
+
+    try:
+        response = messaging.send(message)
+        print("Successfully sent FCM message:", response)
+    except Exception as e:
+        print("Error sending FCM message:", e)
+
+
+def get_unread_count() -> int:
+    """
+    Возвращает количество непрочитанных сообщений (status = 'new').
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM incoming_messages WHERE status = 'new';"
+        )
+        row = cur.fetchone()
+        if not row:
+            return 0
+        return int(row.get("c", 0))
+    finally:
+        cur.close()
+        conn.close()
 
 
 # ==== Модели ==================================================================
@@ -271,7 +350,7 @@ def save_incoming_update(update: dict):
 
 # Webhook для Telegram (оставляем открытым — Telegram не присылает наш заголовок)
 @app.post("/api/webhooks/telegram")
-async def telegram_webhook(req: Request):
+async def telegram_webhook(req: Request, background_tasks: BackgroundTasks):
     data = await req.json()
     print("Telegram webhook:", data)
 
@@ -280,6 +359,13 @@ async def telegram_webhook(req: Request):
     except Exception as e:
         # Не роняем вебхук, просто логируем
         print("Error while saving incoming Telegram message:", e)
+
+    # После сохранения считаем количество непрочитанных и шлём пуш в фоне
+    try:
+        unread_count = get_unread_count()
+        background_tasks.add_task(send_unread_count_push, unread_count)
+    except Exception as e:
+        print("Error scheduling FCM push:", e)
 
     return {"ok": True}
 
@@ -338,9 +424,10 @@ def get_inbox(
     "/api/inbox/{message_id}/read",
     dependencies=[Depends(verify_api_key)],
 )
-def mark_inbox_read(message_id: int):
+def mark_inbox_read(message_id: int, background_tasks: BackgroundTasks):
     """
     Помечает сообщение как прочитанное: status = 'read' по id.
+    И после этого отправляет обновлённый unread_count в FCM.
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -360,5 +447,11 @@ def mark_inbox_read(message_id: int):
     finally:
         cur.close()
         conn.close()
+
+    try:
+        unread_count = get_unread_count()
+        background_tasks.add_task(send_unread_count_push, unread_count)
+    except Exception as e:
+        print("Error scheduling FCM push after mark_read:", e)
 
     return {"status": "ok"}
