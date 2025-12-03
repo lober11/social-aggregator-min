@@ -456,3 +456,39 @@ def mark_inbox_read(message_id: int, background_tasks: BackgroundTasks):
         print("Error scheduling FCM push after mark_read:", e)
 
     return {"status": "ok"}
+
+@app.delete(
+    "/api/inbox/{message_id}",
+    dependencies=[Depends(verify_api_key)],
+)
+def delete_inbox_message(message_id: int, background_tasks: BackgroundTasks):
+    """
+    Удаляет сообщение из incoming_messages по id.
+    После удаления отправляет обновлённый unread_count в FCM.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            DELETE FROM incoming_messages
+            WHERE id = %(id)s;
+            """,
+            {"id": message_id},
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Message not found")
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    # Обновляем количество непрочитанных и шлём пуш
+    try:
+        unread_count = get_unread_count()
+        background_tasks.add_task(send_unread_count_push, unread_count)
+    except Exception as e:
+        print("Error scheduling FCM push after delete:", e)
+
+    return {"status": "ok"}
