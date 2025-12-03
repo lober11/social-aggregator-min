@@ -14,15 +14,6 @@ from psycopg2.extras import RealDictCursor
 import firebase_admin
 from firebase_admin import credentials, messaging
 
-from typing import Optional
-from pydantic import BaseModel
-
-class PublishRequest(BaseModel):
-    text: str
-    include_tg: bool = True
-    include_vk: bool = False
-    tg_chat_id: Optional[int] = None   # ⬅️ НОВОЕ ПОЛЕ
-    # остальные поля, которые у тебя уже есть
 
 app = FastAPI(title="Social Aggregator Minimal API", version="0.3.1")
 
