@@ -120,6 +120,19 @@ def init_db():
         """
     )
 
+    # Таблица доставок сообщений конкретным клиентам (волны)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS near_alert_deliveries (
+            alert_id INTEGER NOT NULL REFERENCES near_alerts(id) ON DELETE CASCADE,
+            client_id UUID NOT NULL REFERENCES near_clients(id) ON DELETE CASCADE,
+            delivered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status VARCHAR(20) NOT NULL DEFAULT 'delivered',
+            PRIMARY KEY (alert_id, client_id)
+        );
+        """
+    )
+
     conn.commit()
     cur.close()
     conn.close()
@@ -150,23 +163,129 @@ def upsert_near_client(
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            INSERT INTO near_clients (id, last_lat, last_lon, last_seen_at)
-            VALUES (%(id)s, %(lat)s, %(lon)s, NOW())
-            ON CONFLICT (id) DO UPDATE
-            SET last_lat = EXCLUDED.last_lat,
-                last_lon = EXCLUDED.last_lon,
-                last_seen_at = EXCLUDED.last_seen_at;
-            """,
-            {"id": str(uid), "lat": lat, "lon": lon},
-        )
+        if lat is not None and lon is not None:
+            # Обновляем и координаты, и last_seen_at
+            cur.execute(
+                """
+                INSERT INTO near_clients (id, last_lat, last_lon, last_seen_at)
+                VALUES (%(id)s, %(lat)s, %(lon)s, NOW())
+                ON CONFLICT (id) DO UPDATE
+                SET last_lat = EXCLUDED.last_lat,
+                    last_lon = EXCLUDED.last_lon,
+                    last_seen_at = EXCLUDED.last_seen_at;
+                """,
+                {"id": str(uid), "lat": lat, "lon": lon},
+            )
+        else:
+            # Обновляем только last_seen_at, координаты не трогаем
+            cur.execute(
+                """
+                INSERT INTO near_clients (id, last_lat, last_lon, last_seen_at)
+                VALUES (%(id)s, NULL, NULL, NOW())
+                ON CONFLICT (id) DO UPDATE
+                SET last_seen_at = EXCLUDED.last_seen_at;
+                """,
+                {"id": str(uid)},
+            )
         conn.commit()
     finally:
         cur.close()
         conn.close()
 
     return str(uid)
+
+
+def distribute_near_alert(
+    alert_id: int,
+    source_client_id: Optional[str],
+    fanout: int = 40,
+):
+    """
+    Делает "волну" от source_client_id:
+    - берём координаты source_client_id;
+    - выбираем ближайших клиентов, у которых ещё нет доставки для этого alert;
+    - записываем им доставки в near_alert_deliveries;
+    - гарантируем, что сам источник тоже видит сообщение.
+    """
+    if not source_client_id:
+        return
+
+    try:
+        uid = uuid.UUID(source_client_id)
+    except Exception:
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Координаты источника
+        cur.execute(
+            """
+            SELECT last_lat, last_lon
+            FROM near_clients
+            WHERE id = %(id)s;
+            """,
+            {"id": str(uid)},
+        )
+        row = cur.fetchone()
+        if not row or row["last_lat"] is None or row["last_lon"] is None:
+            # Нет координат — волну не строим
+            return
+
+        src_lat = row["last_lat"]
+        src_lon = row["last_lon"]
+
+        # Все клиенты без доставки этого alert
+        cur.execute(
+            """
+            SELECT nc.id, nc.last_lat, nc.last_lon
+            FROM near_clients nc
+            LEFT JOIN near_alert_deliveries d
+                ON d.client_id = nc.id AND d.alert_id = %(alert_id)s
+            WHERE d.alert_id IS NULL
+              AND nc.last_lat IS NOT NULL
+              AND nc.last_lon IS NOT NULL
+              AND nc.id <> %(source_id)s;
+            """,
+            {"alert_id": alert_id, "source_id": str(uid)},
+        )
+        rows = cur.fetchall()
+        if not rows:
+            # Некому доставлять
+            return
+
+        # Сортируем по расстоянию (приближённо, по квадрату расстояния)
+        def dist2(r):
+            return (r["last_lat"] - src_lat) ** 2 + (r["last_lon"] - src_lon) ** 2
+
+        rows.sort(key=dist2)
+        selected = rows[:fanout]
+
+        # Вставляем доставки
+        for r in selected:
+            cur.execute(
+                """
+                INSERT INTO near_alert_deliveries (alert_id, client_id, delivered_at, status)
+                VALUES (%(alert_id)s, %(client_id)s, NOW(), 'delivered')
+                ON CONFLICT (alert_id, client_id) DO NOTHING;
+                """,
+                {"alert_id": alert_id, "client_id": str(r["id"])},
+            )
+
+        # Источник тоже должен видеть сообщение
+        cur.execute(
+            """
+            INSERT INTO near_alert_deliveries (alert_id, client_id, delivered_at, status)
+            VALUES (%(alert_id)s, %(client_id)s, NOW(), 'author')
+            ON CONFLICT (alert_id, client_id) DO NOTHING;
+            """,
+            {"alert_id": alert_id, "client_id": str(uid)},
+        )
+
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
 
 # ==== Firebase Admin для FCM ==================================================
@@ -343,10 +462,10 @@ def create_near_alert(
     """
     Создать важное сообщение "рядом".
     Храним в таблице near_alerts (Postgres).
-    Одновременно обновляем информацию о клиенте (near_clients).
+    Одновременно фиксируем клиента и запускаем первую волну.
     """
-    # сохраняем/обновляем клиента
-    upsert_near_client(x_client_id, req.latitude, req.longitude)
+    # сохраняем/обновляем клиента и получаем нормальный UUID
+    client_uuid = upsert_near_client(x_client_id, req.latitude, req.longitude)
 
     now = datetime.now(timezone.utc)
 
@@ -373,8 +492,13 @@ def create_near_alert(
         cur.close()
         conn.close()
 
+    alert = _row_to_nearby_alert(row, distance_m=0)
+
+    # Первая волна от автора
+    distribute_near_alert(alert_id=alert.id, source_client_id=client_uuid, fanout=40)
+
     # Для собственного сообщения distanceMeters = 0 (оно "у нас под ногами")
-    return _row_to_nearby_alert(row, distance_m=0)
+    return alert
 
 
 @app.get("/near/alerts", response_model=List[NearbyAlert])
@@ -384,28 +508,41 @@ def list_near_alerts(
     x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
 ) -> List[NearbyAlert]:
     """
-    Получить важные сообщения 'рядом'.
+    Получить важные сообщения 'рядом' ДЛЯ КОНКРЕТНОГО клиента.
 
-    - Берём сообщения за последние 24 часа.
-    - Если lat/lon не переданы: просто возвращаем последние 50 без расстояния.
-    - Если lat/lon переданы:
-        * сообщения с координатами фильтруем по радиусу 5 км и считаем distanceMeters;
-        * сообщения без координат тоже показываем (в конце списка), но без distanceMeters.
+    - Используем near_alert_deliveries: показываем только то, что доставлено этому clientId.
+    - Сообщения со статусом 'dismissed' не показываем.
+    - Фильтруем по последним 24 часам.
+    - Если lat/lon переданы — считаем distanceMeters от текущих координат клиента.
     """
-    # апдейтим клиента (если clientId есть)
-    upsert_near_client(x_client_id, lat, lon)
+    client_uuid = upsert_near_client(x_client_id, lat, lon)
+    if not client_uuid:
+        return []
 
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute(
             """
-            SELECT id, text, author_name, latitude, longitude, created_at
-            FROM near_alerts
-            WHERE created_at >= NOW() - INTERVAL '24 hours'
-            ORDER BY created_at DESC
+            SELECT
+                a.id,
+                a.text,
+                a.author_name,
+                a.latitude,
+                a.longitude,
+                a.created_at,
+                d.status,
+                d.delivered_at
+            FROM near_alerts a
+            JOIN near_alert_deliveries d
+              ON d.alert_id = a.id
+            WHERE d.client_id = %(client_id)s
+              AND d.status <> 'dismissed'
+              AND a.created_at >= NOW() - INTERVAL '24 hours'
+            ORDER BY d.delivered_at DESC
             LIMIT 200;
-            """
+            """,
+            {"client_id": client_uuid},
         )
         rows = cur.fetchall()
     finally:
@@ -417,24 +554,20 @@ def list_near_alerts(
 
     alerts = [_row_to_nearby_alert(row, distance_m=None) for row in rows]
 
+    # Если нет текущих координат — возвращаем как есть
     if lat is None or lon is None:
-        return alerts[:50]
+        return alerts
 
-    radius_m = 5000  # 5 км
-
-    nearby: List[NearbyAlert] = []
-    no_location: List[NearbyAlert] = []
-
+    # Считаем distanceMeters от текущей позиции клиента
+    result: List[NearbyAlert] = []
     for alert in alerts:
         if alert.latitude is None or alert.longitude is None:
-            no_location.append(alert)
-            continue
+            result.append(alert)
+        else:
+            dist = _haversine_distance_m(lat, lon, alert.latitude, alert.longitude)
+            result.append(alert.copy(update={"distanceMeters": dist}))
 
-        dist = _haversine_distance_m(lat, lon, alert.latitude, alert.longitude)
-        if dist <= radius_m:
-            nearby.append(alert.copy(update={"distanceMeters": dist}))
-
-    return nearby + no_location
+    return result
 
 
 @app.post("/near/alerts/{alert_id}/forward", status_code=204)
@@ -444,15 +577,15 @@ def forward_near_alert(
 ):
     """
     Пометить сообщение как важное и отправить дальше.
-    Пока просто проверяем, что оно существует.
-    В будущем здесь будет логика "волн".
+    - Обновляем статус доставки для текущего клиента.
+    - Запускаем новую волну от его координат.
     """
-    # фиксируем, что клиент существует и активен
-    upsert_near_client(x_client_id, None, None)
+    client_uuid = upsert_near_client(x_client_id, None, None)
 
     conn = get_db_connection()
     cur = conn.cursor()
     try:
+        # Проверяем, что alert существует
         cur.execute(
             "SELECT 1 FROM near_alerts WHERE id = %(id)s;",
             {"id": alert_id},
@@ -460,10 +593,24 @@ def forward_near_alert(
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Alert not found")
+
+        # Помечаем, что этот клиент переслал
+        if client_uuid:
+            cur.execute(
+                """
+                UPDATE near_alert_deliveries
+                SET status = 'forwarded'
+                WHERE alert_id = %(alert_id)s AND client_id = %(client_id)s;
+                """,
+                {"alert_id": alert_id, "client_id": client_uuid},
+            )
+        conn.commit()
     finally:
         cur.close()
         conn.close()
 
+    # Новая волна от этого клиента
+    distribute_near_alert(alert_id=alert_id, source_client_id=client_uuid, fanout=40)
     return
 
 
@@ -473,17 +620,25 @@ def dismiss_near_alert(
     x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
 ):
     """
-    Скрыть сообщение. Сейчас просто удаляем из общей таблицы (для всех).
-    Потом заменим на "персональное скрытие" через near_alert_deliveries.
+    Скрыть сообщение для ТЕКУЩЕГО клиента.
+    Просто ставим status = 'dismissed' в near_alert_deliveries.
+    Сам alert остаётся для других.
     """
-    upsert_near_client(x_client_id, None, None)
+    client_uuid = upsert_near_client(x_client_id, None, None)
+
+    if not client_uuid:
+        return
 
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute(
-            "DELETE FROM near_alerts WHERE id = %(id)s;",
-            {"id": alert_id},
+            """
+            UPDATE near_alert_deliveries
+            SET status = 'dismissed'
+            WHERE alert_id = %(alert_id)s AND client_id = %(client_id)s;
+            """,
+            {"alert_id": alert_id, "client_id": client_uuid},
         )
         conn.commit()
     finally:
