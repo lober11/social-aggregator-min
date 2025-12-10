@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import uuid
 from typing import List, Optional, Literal
 from datetime import datetime, timezone
 
@@ -107,7 +108,7 @@ def init_db():
         """
     )
 
-    # НОВОЕ: таблица клиентов, которые пользуются разделом "Рядом"
+    # Таблица клиентов, которые пользуются разделом "Рядом"
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS near_clients (
@@ -125,6 +126,48 @@ def init_db():
 
 
 init_db()
+
+
+def upsert_near_client(
+    client_id: Optional[str],
+    lat: Optional[float],
+    lon: Optional[float],
+) -> Optional[str]:
+    """
+    Сохраняем/обновляем клиента в near_clients.
+    Если client_id пустой или битый — тихо игнорируем.
+    Возвращаем нормализованный UUID-строку или None.
+    """
+    if not client_id:
+        return None
+
+    try:
+        uid = uuid.UUID(client_id)
+    except Exception:
+        # Неверный формат UUID, не пишем в БД
+        return None
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO near_clients (id, last_lat, last_lon, last_seen_at)
+            VALUES (%(id)s, %(lat)s, %(lon)s, NOW())
+            ON CONFLICT (id) DO UPDATE
+            SET last_lat = EXCLUDED.last_lat,
+                last_lon = EXCLUDED.last_lon,
+                last_seen_at = EXCLUDED.last_seen_at;
+            """,
+            {"id": str(uid), "lat": lat, "lon": lon},
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    return str(uid)
+
 
 # ==== Firebase Admin для FCM ==================================================
 
@@ -293,11 +336,18 @@ def _row_to_nearby_alert(row: dict, distance_m: Optional[int] = None) -> NearbyA
 
 
 @app.post("/near/alerts", response_model=NearbyAlert)
-def create_near_alert(req: SendNearAlertRequest) -> NearbyAlert:
+def create_near_alert(
+    req: SendNearAlertRequest,
+    x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
+) -> NearbyAlert:
     """
     Создать важное сообщение "рядом".
     Храним в таблице near_alerts (Postgres).
+    Одновременно обновляем информацию о клиенте (near_clients).
     """
+    # сохраняем/обновляем клиента
+    upsert_near_client(x_client_id, req.latitude, req.longitude)
+
     now = datetime.now(timezone.utc)
 
     conn = get_db_connection()
@@ -331,6 +381,7 @@ def create_near_alert(req: SendNearAlertRequest) -> NearbyAlert:
 def list_near_alerts(
     lat: Optional[float] = Query(None),
     lon: Optional[float] = Query(None),
+    x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
 ) -> List[NearbyAlert]:
     """
     Получить важные сообщения 'рядом'.
@@ -341,6 +392,9 @@ def list_near_alerts(
         * сообщения с координатами фильтруем по радиусу 5 км и считаем distanceMeters;
         * сообщения без координат тоже показываем (в конце списка), но без distanceMeters.
     """
+    # апдейтим клиента (если clientId есть)
+    upsert_near_client(x_client_id, lat, lon)
+
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -384,11 +438,18 @@ def list_near_alerts(
 
 
 @app.post("/near/alerts/{alert_id}/forward", status_code=204)
-def forward_near_alert(alert_id: int):
+def forward_near_alert(
+    alert_id: int,
+    x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
+):
     """
     Пометить сообщение как важное и отправить дальше.
     Пока просто проверяем, что оно существует.
+    В будущем здесь будет логика "волн".
     """
+    # фиксируем, что клиент существует и активен
+    upsert_near_client(x_client_id, None, None)
+
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -403,15 +464,20 @@ def forward_near_alert(alert_id: int):
         cur.close()
         conn.close()
 
-    # TODO: здесь потом реализуем настоящие "волны"
     return
 
 
 @app.post("/near/alerts/{alert_id}/dismiss", status_code=204)
-def dismiss_near_alert(alert_id: int):
+def dismiss_near_alert(
+    alert_id: int,
+    x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
+):
     """
     Скрыть сообщение. Сейчас просто удаляем из общей таблицы (для всех).
+    Потом заменим на "персональное скрытие" через near_alert_deliveries.
     """
+    upsert_near_client(x_client_id, None, None)
+
     conn = get_db_connection()
     cur = conn.cursor()
     try:
