@@ -202,9 +202,10 @@ def distribute_near_alert(
 ):
     """
     Делает "волну" от source_client_id:
-    - берём координаты source_client_id;
-    - выбираем ближайших клиентов, у которых ещё нет доставки для этого alert;
-    - записываем им доставки в near_alert_deliveries;
+    - получаем координаты источника (если есть);
+    - выбираем ВСЕХ других клиентов, у которых ещё нет доставки этого alert;
+    - сортируем по расстоянию, если можем его посчитать;
+    - рассылаем максимум `fanout` клиентам;
     - ГАРАНТИРУЕМ, что сам источник тоже видит сообщение.
     """
     if not source_client_id:
@@ -218,7 +219,7 @@ def distribute_near_alert(
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Координаты источника
+        # Координаты источника (могут быть NULL)
         cur.execute(
             """
             SELECT last_lat, last_lon
@@ -227,54 +228,54 @@ def distribute_near_alert(
             """,
             {"id": str(uid)},
         )
-        row = cur.fetchone()
+        src_row = cur.fetchone()
+        src_lat = src_row["last_lat"] if src_row else None
+        src_lon = src_row["last_lon"] if src_row else None
 
-        # По-хорошему автор всегда должен увидеть сообщение,
-        # даже если у него нет координат. Поэтому вставляем
-        # его запись В ЛЮБОМ СЛУЧАЕ, а волну строим только
-        # если координаты есть.
-        #
-        # Сначала волна (если возможна)...
-        if row and row["last_lat"] is not None and row["last_lon"] is not None:
-            src_lat = row["last_lat"]
-            src_lon = row["last_lon"]
+        # Все клиенты, у которых ещё нет доставки этого alert (координаты могут быть NULL)
+        cur.execute(
+            """
+            SELECT nc.id, nc.last_lat, nc.last_lon
+            FROM near_clients nc
+            LEFT JOIN near_alert_deliveries d
+                ON d.client_id = nc.id AND d.alert_id = %(alert_id)s
+            WHERE d.alert_id IS NULL
+              AND nc.id <> %(source_id)s;
+            """,
+            {"alert_id": alert_id, "source_id": str(uid)},
+        )
+        rows = cur.fetchall()
 
-            # Все клиенты без доставки этого alert
-            cur.execute(
-                """
-                SELECT nc.id, nc.last_lat, nc.last_lon
-                FROM near_clients nc
-                LEFT JOIN near_alert_deliveries d
-                    ON d.client_id = nc.id AND d.alert_id = %(alert_id)s
-                WHERE d.alert_id IS NULL
-                  AND nc.last_lat IS NOT NULL
-                  AND nc.last_lon IS NOT NULL
-                  AND nc.id <> %(source_id)s;
-                """,
-                {"alert_id": alert_id, "source_id": str(uid)},
-            )
-            rows = cur.fetchall()
-
-            if rows:
-                # Сортируем по расстоянию (приближённо, по квадрату расстояния)
+        if rows:
+            # Если у источника есть координаты, сортируем по расстоянию,
+            # иначе просто по id (для детерминированности).
+            if src_lat is not None and src_lon is not None:
                 def dist2(r):
-                    return (r["last_lat"] - src_lat) ** 2 + (r["last_lon"] - src_lon) ** 2
+                    lat = r["last_lat"]
+                    lon = r["last_lon"]
+                    if lat is None or lon is None:
+                        # клиент без координат — ставим "далеко"
+                        return 1e18
+                    return (lat - src_lat) ** 2 + (lon - src_lon) ** 2
 
                 rows.sort(key=dist2)
-                selected = rows[:fanout]
+            else:
+                rows.sort(key=lambda r: str(r["id"]))
 
-                # Вставляем доставки для выбранных клиентов
-                for r in selected:
-                    cur.execute(
-                        """
-                        INSERT INTO near_alert_deliveries (alert_id, client_id, delivered_at, status)
-                        VALUES (%(alert_id)s, %(client_id)s, NOW(), 'delivered')
-                        ON CONFLICT (alert_id, client_id) DO NOTHING;
-                        """,
-                        {"alert_id": alert_id, "client_id": str(r["id"])},
-                    )
+            selected = rows[:fanout]
 
-        # ...а потом ВСЕГДА вставляем запись для автора
+            # Вставляем доставки для выбранных клиентов
+            for r in selected:
+                cur.execute(
+                    """
+                    INSERT INTO near_alert_deliveries (alert_id, client_id, delivered_at, status)
+                    VALUES (%(alert_id)s, %(client_id)s, NOW(), 'delivered')
+                    ON CONFLICT (alert_id, client_id) DO NOTHING;
+                    """,
+                    {"alert_id": alert_id, "client_id": str(r["id"])},
+                )
+
+        # ВСЕГДА вставляем запись для автора
         cur.execute(
             """
             INSERT INTO near_alert_deliveries (alert_id, client_id, delivered_at, status)
