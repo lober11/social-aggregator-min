@@ -107,13 +107,24 @@ def init_db():
         """
     )
 
+    # НОВОЕ: таблица клиентов, которые пользуются разделом "Рядом"
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS near_clients (
+            id UUID PRIMARY KEY,
+            last_lat DOUBLE PRECISION,
+            last_lon DOUBLE PRECISION,
+            last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+
     conn.commit()
     cur.close()
     conn.close()
 
 
 init_db()
-
 
 # ==== Firebase Admin для FCM ==================================================
 
