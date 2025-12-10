@@ -205,7 +205,7 @@ def distribute_near_alert(
     - берём координаты source_client_id;
     - выбираем ближайших клиентов, у которых ещё нет доставки для этого alert;
     - записываем им доставки в near_alert_deliveries;
-    - гарантируем, что сам источник тоже видит сообщение.
+    - ГАРАНТИРУЕМ, что сам источник тоже видит сообщение.
     """
     if not source_client_id:
         return
@@ -228,51 +228,53 @@ def distribute_near_alert(
             {"id": str(uid)},
         )
         row = cur.fetchone()
-        if not row or row["last_lat"] is None or row["last_lon"] is None:
-            # Нет координат — волну не строим
-            return
 
-        src_lat = row["last_lat"]
-        src_lon = row["last_lon"]
+        # По-хорошему автор всегда должен увидеть сообщение,
+        # даже если у него нет координат. Поэтому вставляем
+        # его запись В ЛЮБОМ СЛУЧАЕ, а волну строим только
+        # если координаты есть.
+        #
+        # Сначала волна (если возможна)...
+        if row and row["last_lat"] is not None and row["last_lon"] is not None:
+            src_lat = row["last_lat"]
+            src_lon = row["last_lon"]
 
-        # Все клиенты без доставки этого alert
-        cur.execute(
-            """
-            SELECT nc.id, nc.last_lat, nc.last_lon
-            FROM near_clients nc
-            LEFT JOIN near_alert_deliveries d
-                ON d.client_id = nc.id AND d.alert_id = %(alert_id)s
-            WHERE d.alert_id IS NULL
-              AND nc.last_lat IS NOT NULL
-              AND nc.last_lon IS NOT NULL
-              AND nc.id <> %(source_id)s;
-            """,
-            {"alert_id": alert_id, "source_id": str(uid)},
-        )
-        rows = cur.fetchall()
-        if not rows:
-            # Некому доставлять
-            return
-
-        # Сортируем по расстоянию (приближённо, по квадрату расстояния)
-        def dist2(r):
-            return (r["last_lat"] - src_lat) ** 2 + (r["last_lon"] - src_lon) ** 2
-
-        rows.sort(key=dist2)
-        selected = rows[:fanout]
-
-        # Вставляем доставки
-        for r in selected:
+            # Все клиенты без доставки этого alert
             cur.execute(
                 """
-                INSERT INTO near_alert_deliveries (alert_id, client_id, delivered_at, status)
-                VALUES (%(alert_id)s, %(client_id)s, NOW(), 'delivered')
-                ON CONFLICT (alert_id, client_id) DO NOTHING;
+                SELECT nc.id, nc.last_lat, nc.last_lon
+                FROM near_clients nc
+                LEFT JOIN near_alert_deliveries d
+                    ON d.client_id = nc.id AND d.alert_id = %(alert_id)s
+                WHERE d.alert_id IS NULL
+                  AND nc.last_lat IS NOT NULL
+                  AND nc.last_lon IS NOT NULL
+                  AND nc.id <> %(source_id)s;
                 """,
-                {"alert_id": alert_id, "client_id": str(r["id"])},
+                {"alert_id": alert_id, "source_id": str(uid)},
             )
+            rows = cur.fetchall()
 
-        # Источник тоже должен видеть сообщение
+            if rows:
+                # Сортируем по расстоянию (приближённо, по квадрату расстояния)
+                def dist2(r):
+                    return (r["last_lat"] - src_lat) ** 2 + (r["last_lon"] - src_lon) ** 2
+
+                rows.sort(key=dist2)
+                selected = rows[:fanout]
+
+                # Вставляем доставки для выбранных клиентов
+                for r in selected:
+                    cur.execute(
+                        """
+                        INSERT INTO near_alert_deliveries (alert_id, client_id, delivered_at, status)
+                        VALUES (%(alert_id)s, %(client_id)s, NOW(), 'delivered')
+                        ON CONFLICT (alert_id, client_id) DO NOTHING;
+                        """,
+                        {"alert_id": alert_id, "client_id": str(r["id"])},
+                    )
+
+        # ...а потом ВСЕГДА вставляем запись для автора
         cur.execute(
             """
             INSERT INTO near_alert_deliveries (alert_id, client_id, delivered_at, status)
