@@ -16,7 +16,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 
-app = FastAPI(title="Social Aggregator Minimal API", version="0.3.1")
+app = FastAPI(title="Social Aggregator Minimal API", version="0.4.0")
 
 
 # ==== Настройки и хелперы =====================================================
@@ -71,11 +71,13 @@ def get_db_connection():
 
 def init_db():
     """
-    Создаёт таблицу incoming_messages, если её ещё нет.
+    Создаёт необходимые таблицы, если их ещё нет.
     Вызывается один раз при старте сервиса.
     """
     conn = get_db_connection()
     cur = conn.cursor()
+
+    # Таблица для входящих сообщений из Telegram
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS incoming_messages (
@@ -90,6 +92,21 @@ def init_db():
         );
         """
     )
+
+    # Таблица для радиальных сообщений "рядом"
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS near_alerts (
+            id SERIAL PRIMARY KEY,
+            text TEXT NOT NULL,
+            author_name TEXT,
+            latitude DOUBLE PRECISION,
+            longitude DOUBLE PRECISION,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+
     conn.commit()
     cur.close()
     conn.close()
@@ -227,20 +244,8 @@ class NearbyAlert(BaseModel):
     authorName: Optional[str] = None
     distanceMeters: Optional[int] = None
     createdAt: str
-    # внутренние поля — можно не использовать на клиенте
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-
-
-_near_alerts: List[NearbyAlert] = []
-_next_near_id: int = 1
-
-
-def _next_alert_id() -> int:
-    global _next_near_id
-    current = _next_near_id
-    _next_near_id += 1
-    return current
 
 
 def _haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
@@ -258,24 +263,57 @@ def _haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) ->
     return int(R * c)
 
 
+def _row_to_nearby_alert(row: dict, distance_m: Optional[int] = None) -> NearbyAlert:
+    created_at = row["created_at"]
+    if isinstance(created_at, datetime):
+        created_str = created_at.strftime("%Y-%m-%d %H:%M")
+    else:
+        created_str = str(created_at)
+
+    return NearbyAlert(
+        id=row["id"],
+        text=row["text"],
+        authorName=row.get("author_name"),
+        distanceMeters=distance_m,
+        createdAt=created_str,
+        latitude=row.get("latitude"),
+        longitude=row.get("longitude"),
+    )
+
+
 @app.post("/near/alerts", response_model=NearbyAlert)
 def create_near_alert(req: SendNearAlertRequest) -> NearbyAlert:
     """
     Создать важное сообщение "рядом".
-    Пока храним только в памяти.
+    Храним в таблице near_alerts (Postgres).
     """
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    alert = NearbyAlert(
-        id=_next_alert_id(),
-        text=req.text,
-        authorName="Автор",  # позже сюда можно подставить реального пользователя
-        distanceMeters=0,
-        createdAt=now_str,
-        latitude=req.latitude,
-        longitude=req.longitude,
-    )
-    _near_alerts.insert(0, alert)
-    return alert
+    now = datetime.now(timezone.utc)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO near_alerts (text, author_name, latitude, longitude, created_at)
+            VALUES (%(text)s, %(author_name)s, %(lat)s, %(lon)s, %(created_at)s)
+            RETURNING id, text, author_name, latitude, longitude, created_at;
+            """,
+            {
+                "text": req.text,
+                "author_name": "Автор",  # TODO: подставить реального пользователя
+                "lat": req.latitude,
+                "lon": req.longitude,
+                "created_at": now,
+            },
+        )
+        row = cur.fetchone()
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    # Для собственного сообщения distanceMeters = 0 (оно "у нас под ногами")
+    return _row_to_nearby_alert(row, distance_m=0)
 
 
 @app.get("/near/alerts", response_model=List[NearbyAlert])
@@ -286,34 +324,51 @@ def list_near_alerts(
     """
     Получить важные сообщения 'рядом'.
 
-    - Если lat/lon не переданы: просто возвращаем последние 50 сообщений.
+    - Берём сообщения за последние 24 часа.
+    - Если lat/lon не переданы: просто возвращаем последние 50 без расстояния.
     - Если lat/lon переданы:
-        * сообщения с известными координатами фильтруем по радиусу;
-        * сообщения БЕЗ координат тоже показываем (в конце списка), но без distanceMeters.
+        * сообщения с координатами фильтруем по радиусу 5 км и считаем distanceMeters;
+        * сообщения без координат тоже показываем (в конце списка), но без distanceMeters.
     """
-    if not _near_alerts:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT id, text, author_name, latitude, longitude, created_at
+            FROM near_alerts
+            WHERE created_at >= NOW() - INTERVAL '24 hours'
+            ORDER BY created_at DESC
+            LIMIT 200;
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    if not rows:
         return []
 
-    # Если клиент не прислал координаты — просто отдаём последние 50 как есть
+    alerts = [_row_to_nearby_alert(row, distance_m=None) for row in rows]
+
     if lat is None or lon is None:
-        return _near_alerts[:50]
+        return alerts[:50]
 
     radius_m = 5000  # 5 км
 
     nearby: List[NearbyAlert] = []
     no_location: List[NearbyAlert] = []
 
-    for alert in _near_alerts:
+    for alert in alerts:
         if alert.latitude is None or alert.longitude is None:
-            # Сообщение без координат — покажем всем, но без расстояния
-            no_location.append(alert.copy(update={"distanceMeters": None}))
+            no_location.append(alert)
             continue
 
         dist = _haversine_distance_m(lat, lon, alert.latitude, alert.longitude)
         if dist <= radius_m:
             nearby.append(alert.copy(update={"distanceMeters": dist}))
 
-    # Сначала близкие с известным расстоянием, потом без координат
     return nearby + no_location
 
 
@@ -321,22 +376,42 @@ def list_near_alerts(
 def forward_near_alert(alert_id: int):
     """
     Пометить сообщение как важное и отправить дальше.
-    Сейчас просто проверяем, что оно существует.
+    Пока просто проверяем, что оно существует.
     """
-    for alert in _near_alerts:
-        if alert.id == alert_id:
-            # TODO: здесь потом реализовать реальное распространение волнами
-            return
-    raise HTTPException(status_code=404, detail="Alert not found")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT 1 FROM near_alerts WHERE id = %(id)s;",
+            {"id": alert_id},
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Alert not found")
+    finally:
+        cur.close()
+        conn.close()
+
+    # TODO: здесь потом реализуем настоящие "волны"
+    return
 
 
 @app.post("/near/alerts/{alert_id}/dismiss", status_code=204)
 def dismiss_near_alert(alert_id: int):
     """
-    Скрыть сообщение. Сейчас просто удаляем его из общей "мини-базы".
+    Скрыть сообщение. Сейчас просто удаляем из общей таблицы (для всех).
     """
-    global _near_alerts
-    _near_alerts = [a for a in _near_alerts if a.id != alert_id]
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "DELETE FROM near_alerts WHERE id = %(id)s;",
+            {"id": alert_id},
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
     return
 
 
