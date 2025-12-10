@@ -285,28 +285,36 @@ def list_near_alerts(
 ) -> List[NearbyAlert]:
     """
     Получить важные сообщения 'рядом'.
-    Если lat/lon переданы – считаем расстояние и фильтруем по радиусу.
-    Если нет – просто возвращаем последние N сообщений.
+
+    - Если lat/lon не переданы: просто возвращаем последние 50 сообщений.
+    - Если lat/lon переданы:
+        * сообщения с известными координатами фильтруем по радиусу;
+        * сообщения БЕЗ координат тоже показываем (в конце списка), но без distanceMeters.
     """
     if not _near_alerts:
         return []
 
+    # Если клиент не прислал координаты — просто отдаём последние 50 как есть
     if lat is None or lon is None:
-        # без координат просто последние 50
         return _near_alerts[:50]
 
     radius_m = 5000  # 5 км
 
-    result: List[NearbyAlert] = []
+    nearby: List[NearbyAlert] = []
+    no_location: List[NearbyAlert] = []
+
     for alert in _near_alerts:
         if alert.latitude is None or alert.longitude is None:
+            # Сообщение без координат — покажем всем, но без расстояния
+            no_location.append(alert.copy(update={"distanceMeters": None}))
             continue
+
         dist = _haversine_distance_m(lat, lon, alert.latitude, alert.longitude)
         if dist <= radius_m:
-            # копию с обновлённым distanceMeters
-            result.append(alert.copy(update={"distanceMeters": dist}))
+            nearby.append(alert.copy(update={"distanceMeters": dist}))
 
-    return result
+    # Сначала близкие с известным расстоянием, потом без координат
+    return nearby + no_location
 
 
 @app.post("/near/alerts/{alert_id}/forward", status_code=204)
