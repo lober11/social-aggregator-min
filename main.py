@@ -153,6 +153,10 @@ def upsert_near_client(
     Сохраняем/обновляем клиента в near_clients.
     Если client_id пустой или битый — тихо игнорируем.
     Возвращаем нормализованный UUID-строку или None.
+
+    ВАЖНО:
+    - Если lat/lon переданы, обновляем координаты и last_seen_at.
+    - Если lat/lon НЕ переданы, обновляем ТОЛЬКО last_seen_at, координаты не трогаем.
     """
     if not client_id:
         return None
@@ -183,8 +187,8 @@ def upsert_near_client(
             # Обновляем только last_seen_at, координаты не трогаем
             cur.execute(
                 """
-                INSERT INTO near_clients (id, last_lat, last_lon, last_seen_at)
-                VALUES (%(id)s, NULL, NULL, NOW())
+                INSERT INTO near_clients (id, last_seen_at)
+                VALUES (%(id)s, NOW())
                 ON CONFLICT (id) DO UPDATE
                 SET last_seen_at = EXCLUDED.last_seen_at;
                 """,
@@ -204,18 +208,23 @@ def distribute_near_alert(
     fanout: int = 40,
 ):
     """
-    Делает "волну" от source_client_id:
+    Делает "волну" от source_client_id.
 
-    - пытается получить координаты источника;
-    - выбирает клиентов, у которых ещё нет доставки этого alert;
-    - если у источника есть координаты:
-        * считаем расстояние до клиентов с координатами;
-        * берём только тех, кто внутри NEAR_WAVE_RADIUS_METERS;
-        * сортируем по расстоянию и режем до fanout;
-      клиенты без координат при этом не участвуют в волне;
-    - если у источника НЕТ координат:
-        * просто берём всех остальных клиентов (без расстояний), сортируем по id и режем до fanout;
-    - ГАРАНТИРУЕМ, что сам источник тоже видит сообщение (status = 'author' или 'forwarded').
+    Логика:
+    - Пытаемся получить координаты источника.
+    - Берём всех клиентов, у которых ещё нет доставки этого alert.
+    - Если у источника ЕСТЬ координаты:
+        * делим кандидатов на:
+            - внутри радиуса NEAR_WAVE_RADIUS_METERS;
+            - остальных (в т.ч. без координат).
+        * если внутри радиуса кто-то есть:
+            - сортируем их по расстоянию и берём до fanout;
+            - если их меньше fanout — добираем остальных по id.
+        * если внутри радиуса никого нет:
+            - просто берём всех кандидатов по id до fanout.
+    - Если у источника НЕТ координат:
+        * берём всех кандидатов по id до fanout.
+    - ВСЕГДА добавляем запись для самого источника (status='author').
     """
     if not source_client_id:
         return
@@ -258,27 +267,45 @@ def distribute_near_alert(
         selected = []
 
         if rows:
-            # Если у источника есть координаты — ограничиваем радиусом
             if src_lat is not None and src_lon is not None:
                 inside_radius = []
+                others = []
 
                 for r in rows:
                     lat = r["last_lat"]
                     lon = r["last_lon"]
+
                     if lat is None or lon is None:
-                        # клиент без координат — не считаем "рядом"
+                        # Клиенты без координат — в отдельный список, но они тоже
+                        # могут получить сообщение как "добавка", если не хватает
+                        # людей в радиусе.
+                        others.append(r)
                         continue
+
                     dist_m = _haversine_distance_m(src_lat, src_lon, lat, lon)
                     if dist_m <= NEAR_WAVE_RADIUS_METERS:
                         inside_radius.append((dist_m, r))
+                    else:
+                        others.append(r)
 
-                # сортируем по расстоянию и режем до fanout
-                inside_radius.sort(key=lambda t: t[0])
-                selected = [r for _, r in inside_radius[:fanout]]
+                if inside_radius:
+                    # Сначала заполняем людьми в радиусе
+                    inside_radius.sort(key=lambda t: t[0])
+                    selected = [r for _, r in inside_radius[:fanout]]
+
+                    # Если их меньше fanout — добираем остальных (в т.ч. без координат)
+                    if len(selected) < fanout and others:
+                        remaining = fanout - len(selected)
+                        others_sorted = sorted(others, key=lambda rr: str(rr["id"]))
+                        selected.extend(others_sorted[:remaining])
+                else:
+                    # Никого в радиусе — просто берём кандидатов по id
+                    rows_sorted = sorted(rows, key=lambda r: str(r["id"]))
+                    selected = rows_sorted[:fanout]
             else:
-                # У источника нет координат — рассылаем всем, сортируя по id
-                rows.sort(key=lambda r: str(r["id"]))
-                selected = rows[:fanout]
+                # У источника нет координат — fallback: просто по id
+                rows_sorted = sorted(rows, key=lambda r: str(r["id"]))
+                selected = rows_sorted[:fanout]
 
             # Вставляем доставки для выбранных клиентов
             for r in selected:
