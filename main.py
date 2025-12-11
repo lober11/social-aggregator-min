@@ -61,6 +61,9 @@ if not DATABASE_URL:
     # Если упадёт здесь — значит не настроена переменная окружения на Render
     raise RuntimeError("DATABASE_URL is not set")
 
+# Радиус волны "рядом" в метрах (по умолчанию 5 км)
+NEAR_WAVE_RADIUS_METERS = float(os.getenv("NEAR_WAVE_RADIUS_METERS", "5000"))
+
 
 def get_db_connection():
     """
@@ -202,11 +205,17 @@ def distribute_near_alert(
 ):
     """
     Делает "волну" от source_client_id:
-    - получаем координаты источника (если есть);
-    - выбираем ВСЕХ других клиентов, у которых ещё нет доставки этого alert;
-    - сортируем по расстоянию, если можем его посчитать;
-    - рассылаем максимум `fanout` клиентам;
-    - ГАРАНТИРУЕМ, что сам источник тоже видит сообщение.
+
+    - пытается получить координаты источника;
+    - выбирает клиентов, у которых ещё нет доставки этого alert;
+    - если у источника есть координаты:
+        * считаем расстояние до клиентов с координатами;
+        * берём только тех, кто внутри NEAR_WAVE_RADIUS_METERS;
+        * сортируем по расстоянию и режем до fanout;
+      клиенты без координат при этом не участвуют в волне;
+    - если у источника НЕТ координат:
+        * просто берём всех остальных клиентов (без расстояний), сортируем по id и режем до fanout;
+    - ГАРАНТИРУЕМ, что сам источник тоже видит сообщение (status = 'author' или 'forwarded').
     """
     if not source_client_id:
         return
@@ -232,7 +241,7 @@ def distribute_near_alert(
         src_lat = src_row["last_lat"] if src_row else None
         src_lon = src_row["last_lon"] if src_row else None
 
-        # Все клиенты, у которых ещё нет доставки этого alert (координаты могут быть NULL)
+        # Все клиенты, у которых ещё нет доставки этого alert (кроме самого источника)
         cur.execute(
             """
             SELECT nc.id, nc.last_lat, nc.last_lon
@@ -246,23 +255,30 @@ def distribute_near_alert(
         )
         rows = cur.fetchall()
 
+        selected = []
+
         if rows:
-            # Если у источника есть координаты, сортируем по расстоянию,
-            # иначе просто по id (для детерминированности).
+            # Если у источника есть координаты — ограничиваем радиусом
             if src_lat is not None and src_lon is not None:
-                def dist2(r):
+                inside_radius = []
+
+                for r in rows:
                     lat = r["last_lat"]
                     lon = r["last_lon"]
                     if lat is None or lon is None:
-                        # клиент без координат — ставим "далеко"
-                        return 1e18
-                    return (lat - src_lat) ** 2 + (lon - src_lon) ** 2
+                        # клиент без координат — не считаем "рядом"
+                        continue
+                    dist_m = _haversine_distance_m(src_lat, src_lon, lat, lon)
+                    if dist_m <= NEAR_WAVE_RADIUS_METERS:
+                        inside_radius.append((dist_m, r))
 
-                rows.sort(key=dist2)
+                # сортируем по расстоянию и режем до fanout
+                inside_radius.sort(key=lambda t: t[0])
+                selected = [r for _, r in inside_radius[:fanout]]
             else:
+                # У источника нет координат — рассылаем всем, сортируя по id
                 rows.sort(key=lambda r: str(r["id"]))
-
-            selected = rows[:fanout]
+                selected = rows[:fanout]
 
             # Вставляем доставки для выбранных клиентов
             for r in selected:
@@ -422,6 +438,7 @@ class NearbyAlert(BaseModel):
     createdAt: str
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    deliveryStatus: Optional[str] = None  # 'author' | 'delivered' | 'forwarded' | 'dismissed'
 
 
 def _haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
@@ -439,7 +456,11 @@ def _haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) ->
     return int(R * c)
 
 
-def _row_to_nearby_alert(row: dict, distance_m: Optional[int] = None) -> NearbyAlert:
+def _row_to_nearby_alert(
+    row: dict,
+    distance_m: Optional[int] = None,
+    delivery_status: Optional[str] = None,
+) -> NearbyAlert:
     created_at = row["created_at"]
     if isinstance(created_at, datetime):
         created_str = created_at.strftime("%Y-%m-%d %H:%M")
@@ -454,7 +475,22 @@ def _row_to_nearby_alert(row: dict, distance_m: Optional[int] = None) -> NearbyA
         createdAt=created_str,
         latitude=row.get("latitude"),
         longitude=row.get("longitude"),
+        deliveryStatus=delivery_status,
     )
+
+
+class NearAlertDeliveryDebug(BaseModel):
+    clientId: str
+    status: str
+    deliveredAt: datetime
+    lastLat: Optional[float] = None
+    lastLon: Optional[float] = None
+    lastSeenAt: Optional[datetime] = None
+
+
+class NearAlertDebug(BaseModel):
+    alert: NearbyAlert
+    deliveries: List[NearAlertDeliveryDebug]
 
 
 @app.post("/near/alerts", response_model=NearbyAlert)
@@ -495,7 +531,7 @@ def create_near_alert(
         cur.close()
         conn.close()
 
-    alert = _row_to_nearby_alert(row, distance_m=0)
+    alert = _row_to_nearby_alert(row, distance_m=0, delivery_status="author")
 
     # Первая волна от автора
     distribute_near_alert(alert_id=alert.id, source_client_id=client_uuid, fanout=40)
@@ -555,7 +591,14 @@ def list_near_alerts(
     if not rows:
         return []
 
-    alerts = [_row_to_nearby_alert(row, distance_m=None) for row in rows]
+    alerts = [
+        _row_to_nearby_alert(
+            row,
+            distance_m=None,
+            delivery_status=row.get("status"),
+        )
+        for row in rows
+    ]
 
     # Если нет текущих координат — возвращаем как есть
     if lat is None or lon is None:
@@ -648,6 +691,72 @@ def dismiss_near_alert(
         cur.close()
         conn.close()
     return
+
+
+@app.get(
+    "/near/debug/alerts/{alert_id}",
+    response_model=NearAlertDebug,
+    dependencies=[Depends(verify_api_key)],
+)
+def debug_near_alert(alert_id: int) -> NearAlertDebug:
+    """
+    Debug: информация по одному alert'у + все доставки и координаты клиентов.
+    Защищено X-Api-Key.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # сам alert
+        cur.execute(
+            """
+            SELECT id, text, author_name, latitude, longitude, created_at
+            FROM near_alerts
+            WHERE id = %(id)s;
+            """,
+            {"id": alert_id},
+        )
+        alert_row = cur.fetchone()
+        if not alert_row:
+            raise HTTPException(status_code=404, detail="Alert not found")
+
+        alert = _row_to_nearby_alert(alert_row, distance_m=None, delivery_status=None)
+
+        # доставки
+        cur.execute(
+            """
+            SELECT
+                d.client_id,
+                d.status,
+                d.delivered_at,
+                c.last_lat,
+                c.last_lon,
+                c.last_seen_at
+            FROM near_alert_deliveries d
+            LEFT JOIN near_clients c
+              ON c.id = d.client_id
+            WHERE d.alert_id = %(alert_id)s
+            ORDER BY d.delivered_at DESC;
+            """,
+            {"alert_id": alert_id},
+        )
+        rows = cur.fetchall()
+
+        deliveries = [
+            NearAlertDeliveryDebug(
+                clientId=str(r["client_id"]),
+                status=r["status"],
+                deliveredAt=r["delivered_at"],
+                lastLat=r.get("last_lat"),
+                lastLon=r.get("last_lon"),
+                lastSeenAt=r.get("last_seen_at"),
+            )
+            for r in rows
+        ]
+    finally:
+        cur.close()
+        conn.close()
+
+    return NearAlertDebug(alert=alert, deliveries=deliveries)
 
 
 # ==== Стандартные эндпоинты ===================================================
