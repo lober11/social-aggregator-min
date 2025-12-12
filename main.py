@@ -123,6 +123,14 @@ def init_db():
         """
     )
 
+    # 🔹 Добавляем fcm_token, если его ещё нет
+    cur.execute(
+        """
+        ALTER TABLE near_clients
+        ADD COLUMN IF NOT EXISTS fcm_token TEXT;
+        """
+    )
+
     # Таблица доставок сообщений конкретным клиентам (волны)
     cur.execute(
         """
@@ -225,6 +233,11 @@ def distribute_near_alert(
     - Если у источника НЕТ координат:
         * берём всех кандидатов по id до fanout.
     - ВСЕГДА добавляем запись для самого источника (status='author').
+
+    Дополнительно:
+    - После вставки новых доставок считаем для этих клиентов
+      количество "непрочитанных" near (status='delivered')
+      и шлём каждому data-push type="near_alert".
     """
     if not source_client_id:
         return
@@ -236,6 +249,10 @@ def distribute_near_alert(
 
     conn = get_db_connection()
     cur = conn.cursor()
+
+    # сюда сложим (fcm_token, unread_count) для пушей
+    push_targets = []
+
     try:
         # Координаты источника (могут быть NULL)
         cur.execute(
@@ -253,7 +270,7 @@ def distribute_near_alert(
         # Все клиенты, у которых ещё нет доставки этого alert (кроме самого источника)
         cur.execute(
             """
-            SELECT nc.id, nc.last_lat, nc.last_lon
+            SELECT nc.id, nc.last_lat, nc.last_lon, nc.fcm_token
             FROM near_clients nc
             LEFT JOIN near_alert_deliveries d
                 ON d.client_id = nc.id AND d.alert_id = %(alert_id)s
@@ -318,6 +335,29 @@ def distribute_near_alert(
                     {"alert_id": alert_id, "client_id": str(r["id"])},
                 )
 
+            # Для каждого выбранного клиента считаем количество "delivered"
+            # и, если есть fcm_token, добавляем в push_targets
+            for r in selected:
+                token = r.get("fcm_token")
+                if not token:
+                    continue
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM near_alert_deliveries
+                    WHERE client_id = %(cid)s
+                      AND status = 'delivered';
+                    """,
+                    {"cid": str(r["id"])},
+                )
+                row = cur.fetchone()
+                if not row:
+                    continue
+                unread = int(row.get("c", 0))
+                if unread > 0:
+                    push_targets.append((token, unread))
+
         # ВСЕГДА вставляем запись для автора
         cur.execute(
             """
@@ -332,6 +372,10 @@ def distribute_near_alert(
     finally:
         cur.close()
         conn.close()
+
+    # ВАЖНО: пушим уже ПОСЛЕ коммита в БД
+    for token, unread in push_targets:
+        send_near_unread_push(token, unread)
 
 
 # ==== Firebase Admin для FCM ==================================================
@@ -388,6 +432,33 @@ def send_unread_count_push(unread_count: int):
         print("Successfully sent FCM message:", response)
     except Exception as e:
         print("Error sending FCM message:", e)
+
+
+def send_near_unread_push(device_token: str, near_unread_count: int):
+    """
+    Отправляет data-push в FCM для раздела "Рядом".
+    Каждый клиент получает свой near_unread_count.
+    """
+    init_firebase()
+    if firebase_app is None:
+        return
+
+    if not device_token:
+        return
+
+    message = messaging.Message(
+        data={
+            "type": "near_alert",
+            "near_unread_count": str(near_unread_count),
+        },
+        token=device_token,
+    )
+
+    try:
+        response = messaging.send(message)
+        print("Successfully sent NEAR FCM message:", response)
+    except Exception as e:
+        print("Error sending NEAR FCM message:", e)
 
 
 def get_unread_count() -> int:
@@ -455,6 +526,10 @@ class SendNearAlertRequest(BaseModel):
     text: str
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+
+
+class RegisterDeviceRequest(BaseModel):
+    fcmToken: str
 
 
 class NearbyAlert(BaseModel):
@@ -717,6 +792,47 @@ def dismiss_near_alert(
     finally:
         cur.close()
         conn.close()
+    return
+
+
+@app.post("/near/register_device", status_code=204)
+def register_device(
+    req: RegisterDeviceRequest,
+    x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
+):
+    """
+    Регистрирует (или обновляет) FCM-токен для клиента раздела "Рядом".
+    Вызывается с:
+      - заголовком X-Client-Id (UUID клиента),
+      - телом {"fcmToken": "..."}.
+    """
+    if not x_client_id:
+        return
+
+    try:
+        uid = uuid.UUID(x_client_id)
+    except Exception:
+        # битый clientId — тихо игнорируем
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO near_clients (id, fcm_token, last_seen_at)
+            VALUES (%(id)s, %(token)s, NOW())
+            ON CONFLICT (id) DO UPDATE
+            SET fcm_token = EXCLUDED.fcm_token,
+                last_seen_at = EXCLUDED.last_seen_at;
+            """,
+            {"id": str(uid), "token": req.fcmToken},
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
     return
 
 
