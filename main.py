@@ -2,11 +2,14 @@ import os
 import json
 import math
 import uuid
-from typing import List, Optional, Literal
+import shutil
+from typing import List, Optional, Literal, Any
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, Query, BackgroundTasks
 from fastapi.responses import PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import httpx
 
@@ -18,6 +21,17 @@ from firebase_admin import credentials, messaging
 
 
 app = FastAPI(title="Social Aggregator Minimal API", version="0.4.0")
+
+# ==== Static / uploads =========================================================
+# Папка, где лежат все загружаемые файлы (и откуда их раздаём через /media)
+UPLOADS_DIR = os.getenv("UPLOADS_DIR", "./uploads")
+NEAR_UPLOAD_DIR = os.getenv("NEAR_UPLOAD_DIR", os.path.join(UPLOADS_DIR, "near"))
+
+# важно: папка должна существовать, иначе StaticFiles может упасть при старте
+os.makedirs(NEAR_UPLOAD_DIR, exist_ok=True)
+
+# /media/near/<alert_id>/<filename> -> ./uploads/near/<alert_id>/<filename>
+app.mount("/media", StaticFiles(directory=UPLOADS_DIR), name="media")
 
 
 # ==== Настройки и хелперы =====================================================
@@ -106,6 +120,21 @@ def init_db():
             author_name TEXT,
             latitude DOUBLE PRECISION,
             longitude DOUBLE PRECISION,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+
+    # Таблица вложений near_alerts
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS near_alert_attachments (
+            id SERIAL PRIMARY KEY,
+            alert_id INTEGER NOT NULL REFERENCES near_alerts(id) ON DELETE CASCADE,
+            filename TEXT NOT NULL,
+            content_type TEXT,
+            url TEXT NOT NULL,
+            size_bytes BIGINT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """
@@ -210,6 +239,21 @@ def upsert_near_client(
     return str(uid)
 
 
+def _haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
+    """
+    Приблизительное расстояние между двумя точками в метрах.
+    """
+    R = 6371000  # радиус Земли, м
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return int(R * c)
+
+
 def distribute_near_alert(
     alert_id: int,
     source_client_id: Optional[str],
@@ -293,9 +337,6 @@ def distribute_near_alert(
                     lon = r["last_lon"]
 
                     if lat is None or lon is None:
-                        # Клиенты без координат — в отдельный список, но они тоже
-                        # могут получить сообщение как "добавка", если не хватает
-                        # людей в радиусе.
                         others.append(r)
                         continue
 
@@ -306,21 +347,17 @@ def distribute_near_alert(
                         others.append(r)
 
                 if inside_radius:
-                    # Сначала заполняем людьми в радиусе
                     inside_radius.sort(key=lambda t: t[0])
                     selected = [r for _, r in inside_radius[:fanout]]
 
-                    # Если их меньше fanout — добираем остальных (в т.ч. без координат)
                     if len(selected) < fanout and others:
                         remaining = fanout - len(selected)
                         others_sorted = sorted(others, key=lambda rr: str(rr["id"]))
                         selected.extend(others_sorted[:remaining])
                 else:
-                    # Никого в радиусе — просто берём кандидатов по id
                     rows_sorted = sorted(rows, key=lambda r: str(r["id"]))
                     selected = rows_sorted[:fanout]
             else:
-                # У источника нет координат — fallback: просто по id
                 rows_sorted = sorted(rows, key=lambda r: str(r["id"]))
                 selected = rows_sorted[:fanout]
 
@@ -336,7 +373,6 @@ def distribute_near_alert(
                 )
 
             # Для каждого выбранного клиента считаем количество "delivered"
-            # и, если есть fcm_token, добавляем в push_targets
             for r in selected:
                 token = r.get("fcm_token")
                 if not token:
@@ -373,7 +409,6 @@ def distribute_near_alert(
         cur.close()
         conn.close()
 
-    # ВАЖНО: пушим уже ПОСЛЕ коммита в БД
     for token, unread in push_targets:
         send_near_unread_push(token, unread)
 
@@ -532,6 +567,13 @@ class RegisterDeviceRequest(BaseModel):
     fcmToken: str
 
 
+class NearFileAttachment(BaseModel):
+    filename: str
+    contentType: Optional[str] = None
+    url: str
+    sizeBytes: Optional[int] = None
+
+
 class NearbyAlert(BaseModel):
     id: int
     text: str
@@ -542,26 +584,15 @@ class NearbyAlert(BaseModel):
     longitude: Optional[float] = None
     deliveryStatus: Optional[str] = None  # 'author' | 'delivered' | 'forwarded' | 'dismissed'
 
-
-def _haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
-    """
-    Приблизительное расстояние между двумя точками в метрах.
-    """
-    R = 6371000  # радиус Земли, м
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return int(R * c)
+    # новое
+    attachments: List[NearFileAttachment] = []
 
 
 def _row_to_nearby_alert(
     row: dict,
     distance_m: Optional[int] = None,
     delivery_status: Optional[str] = None,
+    attachments: Optional[List[NearFileAttachment]] = None,
 ) -> NearbyAlert:
     created_at = row["created_at"]
     if isinstance(created_at, datetime):
@@ -578,7 +609,44 @@ def _row_to_nearby_alert(
         latitude=row.get("latitude"),
         longitude=row.get("longitude"),
         deliveryStatus=delivery_status,
+        attachments=attachments or [],
     )
+
+
+def _safe_filename(name: str) -> str:
+    name = (name or "").strip()
+    name = name.replace("\\", "_").replace("/", "_")
+    return name or "file"
+
+
+def _parse_optional_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if s == "" or s.lower() == "null":
+        return None
+    return float(s)
+
+
+def _unique_path(dir_path: str, filename: str) -> str:
+    """
+    Если файл с таким именем уже есть — добавляем префикс, чтобы не перезатереть.
+    """
+    base = _safe_filename(filename)
+    candidate = os.path.join(dir_path, base)
+    if not os.path.exists(candidate):
+        return candidate
+
+    prefix = uuid.uuid4().hex[:8]
+    candidate = os.path.join(dir_path, f"{prefix}_{base}")
+    return candidate
+
+
+def _save_uploadfile_to_path(upload_file, dst_path: str) -> None:
+    with open(dst_path, "wb") as out:
+        shutil.copyfileobj(upload_file.file, out)
 
 
 class NearAlertDeliveryDebug(BaseModel):
@@ -596,23 +664,60 @@ class NearAlertDebug(BaseModel):
 
 
 @app.post("/near/alerts", response_model=NearbyAlert)
-def create_near_alert(
-    req: SendNearAlertRequest,
+async def create_near_alert(
+    request: Request,
     x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
 ) -> NearbyAlert:
     """
     Создать важное сообщение "рядом".
-    Храним в таблице near_alerts (Postgres).
-    Одновременно фиксируем клиента и запускаем первую волну.
+    Поддерживает:
+    - JSON (как раньше)
+    - multipart/form-data с файлами:
+        text=...
+        latitude=...
+        longitude=...
+        files=<file>, files=<file2>...
+
+    Храним alert в near_alerts (Postgres),
+    вложения — в near_alert_attachments + на диске,
+    фиксируем клиента и запускаем первую волну.
     """
-    # сохраняем/обновляем клиента и получаем нормальный UUID
-    client_uuid = upsert_near_client(x_client_id, req.latitude, req.longitude)
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    text: str
+    latitude: Optional[float]
+    longitude: Optional[float]
+    upload_files: List[Any] = []
+
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        text = str(form.get("text") or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="text is required")
+
+        latitude = _parse_optional_float(form.get("latitude"))
+        longitude = _parse_optional_float(form.get("longitude"))
+
+        upload_files = form.getlist("files")  # list[UploadFile]
+    else:
+        data = await request.json()
+        req = SendNearAlertRequest.model_validate(data)
+        text = req.text
+        latitude = req.latitude
+        longitude = req.longitude
+
+    # сохраняем/обновляем клиента
+    client_uuid = upsert_near_client(x_client_id, latitude, longitude)
 
     now = datetime.now(timezone.utc)
 
     conn = get_db_connection()
     cur = conn.cursor()
+
+    attachments_models: List[NearFileAttachment] = []
+
     try:
+        # 1) создаём alert
         cur.execute(
             """
             INSERT INTO near_alerts (text, author_name, latitude, longitude, created_at)
@@ -620,25 +725,73 @@ def create_near_alert(
             RETURNING id, text, author_name, latitude, longitude, created_at;
             """,
             {
-                "text": req.text,
+                "text": text,
                 "author_name": "Автор",  # TODO: подставить реального пользователя
-                "lat": req.latitude,
-                "lon": req.longitude,
+                "lat": latitude,
+                "lon": longitude,
                 "created_at": now,
             },
         )
         row = cur.fetchone()
+        alert_id = int(row["id"])
+
+        # 2) если есть файлы — сохраняем и пишем в таблицу near_alert_attachments
+        if upload_files:
+            alert_dir = os.path.join(NEAR_UPLOAD_DIR, str(alert_id))
+            os.makedirs(alert_dir, exist_ok=True)
+
+            for f in upload_files:
+                if f is None:
+                    continue
+
+                original_name = getattr(f, "filename", None) or "file"
+                dst_path = _unique_path(alert_dir, original_name)
+                saved_name = os.path.basename(dst_path)
+
+                await run_in_threadpool(_save_uploadfile_to_path, f, dst_path)
+
+                size_bytes = None
+                try:
+                    size_bytes = os.path.getsize(dst_path)
+                except Exception:
+                    pass
+
+                content_type_f = getattr(f, "content_type", None)
+                url = f"/media/near/{alert_id}/{saved_name}"
+
+                cur.execute(
+                    """
+                    INSERT INTO near_alert_attachments (alert_id, filename, content_type, url, size_bytes)
+                    VALUES (%(alert_id)s, %(filename)s, %(content_type)s, %(url)s, %(size_bytes)s);
+                    """,
+                    {
+                        "alert_id": alert_id,
+                        "filename": saved_name,
+                        "content_type": content_type_f,
+                        "url": url,
+                        "size_bytes": size_bytes,
+                    },
+                )
+
+                attachments_models.append(
+                    NearFileAttachment(
+                        filename=saved_name,
+                        contentType=content_type_f,
+                        url=url,
+                        sizeBytes=size_bytes,
+                    )
+                )
+
         conn.commit()
     finally:
         cur.close()
         conn.close()
 
-    alert = _row_to_nearby_alert(row, distance_m=0, delivery_status="author")
+    alert = _row_to_nearby_alert(row, distance_m=0, delivery_status="author", attachments=attachments_models)
 
     # Первая волна от автора
     distribute_near_alert(alert_id=alert.id, source_client_id=client_uuid, fanout=40)
 
-    # Для собственного сообщения distanceMeters = 0 (оно "у нас под ногами")
     return alert
 
 
@@ -655,6 +808,7 @@ def list_near_alerts(
     - Сообщения со статусом 'dismissed' не показываем.
     - Фильтруем по последним 24 часам.
     - Если lat/lon переданы — считаем distanceMeters от текущих координат клиента.
+    - attachments подтягиваем из near_alert_attachments.
     """
     client_uuid = upsert_near_client(x_client_id, lat, lon)
     if not client_uuid:
@@ -686,27 +840,53 @@ def list_near_alerts(
             {"client_id": client_uuid},
         )
         rows = cur.fetchall()
+
+        if not rows:
+            return []
+
+        alert_ids = [int(r["id"]) for r in rows]
+
+        # Все вложения пачкой
+        cur.execute(
+            """
+            SELECT alert_id, filename, content_type, url, size_bytes
+            FROM near_alert_attachments
+            WHERE alert_id = ANY(%(ids)s)
+            ORDER BY id ASC;
+            """,
+            {"ids": alert_ids},
+        )
+        att_rows = cur.fetchall()
+
     finally:
         cur.close()
         conn.close()
 
-    if not rows:
-        return []
+    attachments_by_alert: dict[int, List[NearFileAttachment]] = {}
+    for a in att_rows:
+        aid = int(a["alert_id"])
+        attachments_by_alert.setdefault(aid, []).append(
+            NearFileAttachment(
+                filename=a["filename"],
+                contentType=a.get("content_type"),
+                url=a["url"],
+                sizeBytes=a.get("size_bytes"),
+            )
+        )
 
     alerts = [
         _row_to_nearby_alert(
             row,
             distance_m=None,
             delivery_status=row.get("status"),
+            attachments=attachments_by_alert.get(int(row["id"]), []),
         )
         for row in rows
     ]
 
-    # Если нет текущих координат — возвращаем как есть
     if lat is None or lon is None:
         return alerts
 
-    # Считаем distanceMeters от текущей позиции клиента
     result: List[NearbyAlert] = []
     for alert in alerts:
         if alert.latitude is None or alert.longitude is None:
@@ -812,7 +992,6 @@ def register_device(
     try:
         uid = uuid.UUID(x_client_id)
     except Exception:
-        # битый clientId — тихо игнорируем
         return
 
     conn = get_db_connection()
@@ -862,7 +1041,28 @@ def debug_near_alert(alert_id: int) -> NearAlertDebug:
         if not alert_row:
             raise HTTPException(status_code=404, detail="Alert not found")
 
-        alert = _row_to_nearby_alert(alert_row, distance_m=None, delivery_status=None)
+        # вложения
+        cur.execute(
+            """
+            SELECT filename, content_type, url, size_bytes
+            FROM near_alert_attachments
+            WHERE alert_id = %(id)s
+            ORDER BY id ASC;
+            """,
+            {"id": alert_id},
+        )
+        att_rows = cur.fetchall()
+        atts = [
+            NearFileAttachment(
+                filename=a["filename"],
+                contentType=a.get("content_type"),
+                url=a["url"],
+                sizeBytes=a.get("size_bytes"),
+            )
+            for a in att_rows
+        ]
+
+        alert = _row_to_nearby_alert(alert_row, distance_m=None, delivery_status=None, attachments=atts)
 
         # доставки
         cur.execute(
@@ -904,7 +1104,6 @@ def debug_near_alert(alert_id: int) -> NearAlertDebug:
 
 # ==== Стандартные эндпоинты ===================================================
 
-# Root
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Social Aggregator Minimal API"}
@@ -915,7 +1114,6 @@ def root_head():
     return PlainTextResponse("", status_code=200)
 
 
-# Health endpoint (GET и HEAD)
 @app.get("/health")
 def health():
     return {"status": "healthy"}
@@ -926,21 +1124,17 @@ def health_head():
     return PlainTextResponse("", status_code=200)
 
 
-# Пустая лента (зарезервировано под будущее)
 @app.get("/api/feed")
 def feed():
     return []
 
 
-# Тестовая отправка в TG (требует X-Api-Key)
 @app.get("/api/telegram/send", dependencies=[Depends(verify_api_key)])
 async def telegram_send(chat_id: str, text: str):
     result = await tg_send_message(chat_id=chat_id, text=text)
     return {"ok": True, "result": result}
 
 
-# Унифицированная публикация (поддерживает только TG пока) — защищено X-Api-Key
-# Оба пути работают: /api/posts/publish и /api/publish
 @app.post(
     "/api/posts/publish",
     response_model=PublishResponse,
@@ -980,7 +1174,6 @@ def save_incoming_update(update: dict):
         or update.get("edited_channel_post")
     )
     if not message:
-        # Не текстовый апдейт — просто игнорируем
         return
 
     update_id = update.get("update_id")
@@ -999,7 +1192,6 @@ def save_incoming_update(update: dict):
 
     text = message.get("text") or message.get("caption")
     if not text:
-        # Сообщение без текста/подписи нам пока неинтересно
         return
 
     ts = message.get("date")
@@ -1009,7 +1201,6 @@ def save_incoming_update(update: dict):
         dt = datetime.now(timezone.utc)
 
     if update_id is None or chat_id is None:
-        # Без этих полей не сможем корректно сохранить
         return
 
     conn = get_db_connection()
@@ -1039,7 +1230,6 @@ def save_incoming_update(update: dict):
         conn.close()
 
 
-# Webhook для Telegram (оставляем открытым — Telegram не присылает наш заголовок)
 @app.post("/api/webhooks/telegram")
 async def telegram_webhook(req: Request, background_tasks: BackgroundTasks):
     data = await req.json()
@@ -1048,10 +1238,8 @@ async def telegram_webhook(req: Request, background_tasks: BackgroundTasks):
     try:
         save_incoming_update(data)
     except Exception as e:
-        # Не роняем вебхук, просто логируем
         print("Error while saving incoming Telegram message:", e)
 
-    # После сохранения считаем количество непрочитанных и шлём пуш в фоне
     try:
         unread_count = get_unread_count()
         background_tasks.add_task(send_unread_count_push, unread_count)
@@ -1072,11 +1260,6 @@ def get_inbox(
     limit: int = Query(50, ge=1, le=200),
     chat_id: Optional[int] = Query(None),
 ):
-    """
-    Возвращает последние входящие сообщения.
-    - limit: сколько сообщений (по умолчанию 50, максимум 200)
-    - chat_id: опционально — фильтр по id чата
-    """
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -1107,7 +1290,6 @@ def get_inbox(
         cur.close()
         conn.close()
 
-    # rows — это список dict благодаря RealDictCursor
     return [InboxMessage(**row) for row in rows]
 
 
@@ -1116,10 +1298,6 @@ def get_inbox(
     dependencies=[Depends(verify_api_key)],
 )
 def mark_inbox_read(message_id: int, background_tasks: BackgroundTasks):
-    """
-    Помечает сообщение как прочитанное: status = 'read' по id.
-    И после этого отправляет обновлённый unread_count в FCM.
-    """
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -1153,10 +1331,6 @@ def mark_inbox_read(message_id: int, background_tasks: BackgroundTasks):
     dependencies=[Depends(verify_api_key)],
 )
 def delete_inbox_message(message_id: int, background_tasks: BackgroundTasks):
-    """
-    Удаляет сообщение из incoming_messages по id.
-    После удаления отправляет обновлённый unread_count в FCM.
-    """
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -1175,7 +1349,6 @@ def delete_inbox_message(message_id: int, background_tasks: BackgroundTasks):
         cur.close()
         conn.close()
 
-    # Обновляем количество непрочитанных и шлём пуш
     try:
         unread_count = get_unread_count()
         background_tasks.add_task(send_unread_count_push, unread_count)
